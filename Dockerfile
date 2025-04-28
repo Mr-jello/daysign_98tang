@@ -49,16 +49,14 @@ RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
 # 创建工作目录
 WORKDIR /app
 
+# 从构建阶段复制编译好的二进制文件
+COPY --from=builder /daysign/daysign98tang /app/
+
 # 创建必要的目录结构
 RUN mkdir -p /app/logs
 
-# 从构建阶段复制编译好的二进制文件
-COPY --from=builder /daysign/daysign98tang /app/
-# 复制env文件
-COPY --from=builder /daysign/.env /app/
-
-# 设置 volume 挂载点
-VOLUME ["/app/logs", "/app/cookies"]
+# 声明卷挂载点
+VOLUME ["/app/logs", "/app/cookies", "/app/.env"]
 
 # 容器启动命令
 CMD ["/app/daysign98tang"]

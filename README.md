@@ -1,4 +1,4 @@
-# daysign_
+# daysign_98tang
 
 本项目是一个在98tang自动回帖与签到程序，通过 [chromedp](https://github.com/chromedp/chromedp) 实现网页自动化操作，同时使用 [Telegram Bot API](https://core.telegram.org/bots/api) 在签到成功后发送通知。
 
