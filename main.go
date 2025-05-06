@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -507,6 +508,34 @@ func startScheduler() {
 
 // NewBrowser 创建一个新的 Browser 实例
 func NewBrowser() (*Browser, error) {
+	// 从环境变量中获取Chrome路径
+	chromePath := os.Getenv("CHROME_PATH")
+	if chromePath == "" {
+		// 尝试几个常见的路径
+		possiblePaths := []string{
+			"google-chrome",
+			"chromium",
+			"chromium-browser",
+			"/usr/bin/chromium",
+			"/usr/bin/chromium-browser",
+			"/usr/bin/google-chrome",
+		}
+
+		for _, path := range possiblePaths {
+			// 使用 which 命令检查可执行文件是否存在
+			cmd := exec.Command("which", path)
+			if err := cmd.Run(); err == nil {
+				chromePath = path
+				log.Printf("自动检测到Chrome路径: %s", chromePath)
+				break
+			}
+		}
+
+		if chromePath == "" {
+			log.Println("未找到Chrome可执行文件，请设置CHROME_PATH环境变量")
+		}
+	}
+
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.NoDefaultBrowserCheck,
 		// 非无头模式便于调试, 本地测试改成false，启动图形界面
