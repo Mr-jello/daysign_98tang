@@ -39,6 +39,7 @@ make build/make build-all
 # Ubuntu
 sudo apt-get update
 sudo apt-get install -y chromium-browser
+sudo snap install chromium
 ```
 
 
@@ -64,10 +65,10 @@ make build-all
 - 选择适合服务器架构，将生成的二进制文件 `daysign98tang_xx` 修改为 `daysign98tang`上传到服务器
 - 例如：/root目录下
 
-5. 执行二进制文件（有日志文件，所以不需要重定向输出）
+5. 执行脚本运行程序
 
 ```bash
-nohup ./daysign98tang &
+./start.sh
 ```
 
 ### 3. 使用 Docker 部署
