@@ -122,6 +122,9 @@ var ReplyContents = []string{
 // 全局变量，用于存储日志文件
 var currentLogFile *os.File
 
+// Chrome路径
+var savedChromePath string
+
 // 全局任务状态和调度器
 var (
 	todayCheckInSuccess bool
@@ -281,6 +284,8 @@ func init() {
 
 	// 配置日志
 	setupLogger()
+
+	log.Printf("初始化完成，当前配置的重试间隔为: %v", RetryInterval)
 }
 
 // 设置日志
@@ -377,6 +382,12 @@ func executeTask() {
 		return
 	}
 
+	// 尝试从保存的文件中加载Chrome路径
+	if savedPath := loadChromePathFromFile(); savedPath != "" && os.Getenv("CHROME_PATH") == "" {
+		log.Printf("从保存的文件中加载Chrome路径: %s", savedPath)
+		os.Setenv("CHROME_PATH", savedPath)
+	}
+
 	// 获取当前日期
 	currentDate := time.Now().Format("2006-01-02")
 
@@ -417,6 +428,11 @@ func executeTask() {
 		log.Printf("创建浏览器实例失败: %v", err)
 		scheduleRetry("创建浏览器失败: " + err.Error())
 		return
+	}
+
+	// 保存成功的Chrome路径
+	if chromePath := os.Getenv("CHROME_PATH"); chromePath != "" {
+		saveChromePathToFile(chromePath)
 	}
 
 	// 确保无论如何浏览器都会被关闭
@@ -534,8 +550,15 @@ func scheduleRetry(reason string) {
 		retryTimer.Stop()
 	}
 
+	// 保存当前Chrome路径以便在重试时使用
+	currentChromePath := os.Getenv("CHROME_PATH")
+
+	// 使用环境变量中设置的重试间隔
+	actualRetryInterval := RetryInterval
+	log.Printf("计划重试，使用间隔: %v", actualRetryInterval)
+
 	// 设置新的重试计时器
-	retryTimer = time.AfterFunc(RetryInterval, func() {
+	retryTimer = time.AfterFunc(actualRetryInterval, func() {
 		// 重试前再次检查是否已成功签到
 		currentDate := time.Now().Format("2006-01-02")
 		taskMutex.Lock()
@@ -547,6 +570,12 @@ func scheduleRetry(reason string) {
 			return
 		}
 
+		// 在重试前恢复Chrome路径环境变量
+		if currentChromePath != "" {
+			log.Printf("重试时使用保存的Chrome路径: %s", currentChromePath)
+			os.Setenv("CHROME_PATH", currentChromePath)
+		}
+
 		log.Println("开始重试任务...")
 		executeTask()
 	})
@@ -556,7 +585,7 @@ func scheduleRetry(reason string) {
 		"❌ 任务失败 ❌\n时间: %s\n原因: %s\n将在 %d 分钟后重试",
 		time.Now().Format("2006-01-02 15:04:05"),
 		reason,
-		int(RetryInterval.Minutes()),
+		int(actualRetryInterval.Minutes()),
 	)
 
 	if err := SendTelegramNotification(failureMsg); err != nil {
@@ -583,24 +612,36 @@ func NewBrowser() (*Browser, error) {
 	// 从环境变量中获取Chrome路径
 	chromePath := os.Getenv("CHROME_PATH")
 	if chromePath == "" {
-		// 尝试几个常见的路径
-		possiblePaths := []string{
-			"/snap/bin/chromium",
-			"chromium",
-			"google-chrome",
-			"chromium-browser",
-			"/usr/bin/chromium",
-			"/usr/bin/chromium-browser",
-			"/usr/bin/google-chrome",
+		// 尝试从.env文件重新加载
+		if err := godotenv.Load(); err == nil {
+			chromePath = os.Getenv("CHROME_PATH")
+			log.Printf("从.env文件读取Chrome路径: %s", chromePath)
 		}
 
-		for _, path := range possiblePaths {
-			// 使用 which 命令检查可执行文件是否存在
-			cmd := exec.Command("which", path)
-			if err := cmd.Run(); err == nil {
-				chromePath = path
-				log.Printf("自动检测到Chrome路径: %s", chromePath)
-				break
+		// 如果仍然为空，尝试几个常见的路径
+		if chromePath == "" {
+			possiblePaths := []string{
+				"/snap/bin/chromium",
+				"chromium",
+				"/usr/bin/chromium-browser",
+				"/usr/bin/chromium",
+				"chromium-browser",
+				"/usr/bin/google-chrome",
+				"google-chrome",
+			}
+
+			for _, path := range possiblePaths {
+				// 使用 which 命令检查可执行文件是否存在
+				cmd := exec.Command("which", path)
+				if output, err := cmd.Output(); err == nil {
+					// 去除输出中可能的换行符
+					chromePath = strings.TrimSpace(string(output))
+					log.Printf("自动检测到Chrome路径: %s", chromePath)
+
+					// 立即设置环境变量，确保下次使用
+					os.Setenv("CHROME_PATH", chromePath)
+					break
+				}
 			}
 		}
 
@@ -656,6 +697,39 @@ func NewBrowser() (*Browser, error) {
 		ctx:    ctx,
 		cancel: combinedCancel,
 	}, nil
+}
+
+// saveChromePathToFile 将成功使用的Chrome路径保存到文件
+func saveChromePathToFile(path string) {
+	if path == "" {
+		return
+	}
+
+	// 保存到内存中
+	savedChromePath = path
+
+	// 写入到文件
+	err := os.WriteFile(".chrome_path", []byte(path), 0644)
+	if err != nil {
+		log.Printf("保存Chrome路径到文件失败: %v", err)
+	}
+}
+
+// loadChromePathFromFile 从文件加载之前保存的Chrome路径
+func loadChromePathFromFile() string {
+	// 如果内存中已经有值，优先使用
+	if savedChromePath != "" {
+		return savedChromePath
+	}
+
+	// 从文件加载
+	data, err := os.ReadFile(".chrome_path")
+	if err != nil {
+		return ""
+	}
+
+	savedChromePath = strings.TrimSpace(string(data))
+	return savedChromePath
 }
 
 // 修改监控函数以支持退出
