@@ -9,11 +9,14 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -121,6 +124,9 @@ var currentLogFile *os.File
 
 // 全局任务状态和调度器
 var (
+	todayCheckInSuccess bool
+	lastCheckInDate     string
+
 	taskMutex       sync.Mutex
 	isTaskRunning   bool
 	lastRunTime     time.Time
@@ -152,6 +158,7 @@ var (
 type Browser struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	cmd    *exec.Cmd // 记录 Chrome 进程
 }
 
 // Execute 用于执行一组 chromedp.Action，并设置一个超时
@@ -363,6 +370,27 @@ func executeTask() {
 		taskMutex.Unlock()
 		return
 	}
+	// 如果距离上次执行时间不足5分钟，跳过本次执行
+	if !lastRunTime.IsZero() && time.Since(lastRunTime) < 5*time.Minute {
+		log.Printf("距离上次执行仅 %v，小于5分钟，跳过本次执行", time.Since(lastRunTime))
+		taskMutex.Unlock()
+		return
+	}
+
+	// 获取当前日期
+	currentDate := time.Now().Format("2006-01-02")
+
+	// 检查是否是新的一天，如果是则重置签到状态
+	if currentDate != lastCheckInDate {
+		todayCheckInSuccess = false
+		lastCheckInDate = currentDate
+	}
+
+	// 如果今天已经成功签到，直接返回，不执行任务
+	if todayCheckInSuccess {
+		taskMutex.Unlock()
+		return
+	}
 
 	// 更新任务状态
 	isTaskRunning = true
@@ -390,7 +418,15 @@ func executeTask() {
 		scheduleRetry("创建浏览器失败: " + err.Error())
 		return
 	}
-	defer browser.Close()
+
+	// 确保无论如何浏览器都会被关闭
+	browserClosed := false
+	defer func() {
+		if !browserClosed {
+			log.Println("关闭浏览器实例...")
+			browser.Close()
+		}
+	}()
 
 	// 步骤1: 访问论坛首页并确认年龄
 	if err = browser.NavigateTo(BaseURL); err != nil {
@@ -434,6 +470,14 @@ func executeTask() {
 		return
 	}
 
+	// 签到步骤后，检查是否成功签到
+	if strings.Contains(checkInResult, "成功") || strings.Contains(checkInResult, "已签到") {
+		taskMutex.Lock()
+		todayCheckInSuccess = true
+		taskMutex.Unlock()
+		log.Println("今天签到成功，不再重试")
+	}
+
 	// 步骤6：获取金币信息
 	coins, err := browser.GetMyCoins()
 	if err != nil {
@@ -462,10 +506,27 @@ func executeTask() {
 	taskMutex.Lock()
 	lastSuccessTime = time.Now()
 	taskMutex.Unlock()
+
+	// 在函数结束前明确关闭浏览器
+	log.Println("任务完成，关闭浏览器...")
+	browser.Close()
+	browserClosed = true
 }
 
 // scheduleRetry 安排任务重试
 func scheduleRetry(reason string) {
+	// 获取当前日期
+	currentDate := time.Now().Format("2006-01-02")
+
+	taskMutex.Lock()
+	// 如果今天已经成功签到，不安排重试
+	if todayCheckInSuccess && currentDate == lastCheckInDate {
+		log.Printf("今天已经成功签到，不重试: %s", reason)
+		taskMutex.Unlock()
+		return
+	}
+	taskMutex.Unlock()
+
 	log.Printf("任务失败，原因: %s，将在 %v 后重试", reason, RetryInterval)
 
 	// 取消之前的重试计时器（如果存在）
@@ -475,6 +536,17 @@ func scheduleRetry(reason string) {
 
 	// 设置新的重试计时器
 	retryTimer = time.AfterFunc(RetryInterval, func() {
+		// 重试前再次检查是否已成功签到
+		currentDate := time.Now().Format("2006-01-02")
+		taskMutex.Lock()
+		alreadySuccess := todayCheckInSuccess && currentDate == lastCheckInDate
+		taskMutex.Unlock()
+
+		if alreadySuccess {
+			log.Println("定时重试前检测到今天已经成功签到，取消重试")
+			return
+		}
+
 		log.Println("开始重试任务...")
 		executeTask()
 	})
@@ -513,8 +585,9 @@ func NewBrowser() (*Browser, error) {
 	if chromePath == "" {
 		// 尝试几个常见的路径
 		possiblePaths := []string{
-			"google-chrome",
+			"/snap/bin/chromium",
 			"chromium",
+			"google-chrome",
 			"chromium-browser",
 			"/usr/bin/chromium",
 			"/usr/bin/chromium-browser",
@@ -534,18 +607,34 @@ func NewBrowser() (*Browser, error) {
 		if chromePath == "" {
 			log.Println("未找到Chrome可执行文件，请设置CHROME_PATH环境变量")
 		}
+	} else {
+		log.Printf("使用环境变量中配置的Chrome路径: %s", chromePath)
+	}
+
+	// 强制杀死所有可能残留的 Chrome 进程
+	if os.Getenv("FORCE_KILL_CHROME") == "true" {
+		killPreviousChrome()
 	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.NoDefaultBrowserCheck,
-		// 非无头模式便于调试, 本地测试改成false，启动图形界面
 		chromedp.Flag("headless", EnableHeadless),
-		chromedp.Flag("ignore-certificate-errors", true),
-		chromedp.Flag("disable-web-security", true),
-		chromedp.NoFirstRun,
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-software-rasterizer", true),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-infobars", true),
+		chromedp.Flag("disable-notifications", true),
+		chromedp.Flag("mute-audio", true),
+		chromedp.Flag("ignore-certificate-errors", true),
+		chromedp.Flag("disable-popup-blocking", true),
+		chromedp.Flag("incognito", true),
+		chromedp.Flag("disable-translate", true),
+		chromedp.Flag("disable-sync", true),
+		chromedp.Flag("disable-background-networking", true),
+		chromedp.ExecPath(chromePath),
 	)
 
 	// 创建分配器上下文
@@ -556,7 +645,7 @@ func NewBrowser() (*Browser, error) {
 	if err := chromedp.Run(ctx); err != nil {
 		cancelCtx()
 		cancelAlloc()
-		return nil, err
+		return nil, fmt.Errorf("Chrome启动失败: %v", err)
 	}
 	// 合并取消函数
 	combinedCancel := func() {
@@ -567,6 +656,97 @@ func NewBrowser() (*Browser, error) {
 		ctx:    ctx,
 		cancel: combinedCancel,
 	}, nil
+}
+
+// 修改监控函数以支持退出
+func monitorChromeProcesses(stop chan struct{}) {
+	log.Println("开始监控Chrome进程...")
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	// 立即执行一次检查
+	checkChromeProcesses()
+
+	for {
+		select {
+		case <-ticker.C:
+			checkChromeProcesses()
+		case <-stop:
+			log.Println("Chrome进程监控已停止")
+			return
+		}
+	}
+}
+
+// 检查Chrome进程数量并在必要时清理
+func checkChromeProcesses() {
+	var cmd *exec.Cmd
+	var output []byte
+	var err error
+	var count int
+
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH")
+		output, err = cmd.Output()
+		if err == nil {
+			// Windows: 计算输出中"chrome.exe"的行数
+			count = strings.Count(string(output), "chrome.exe")
+		}
+	} else {
+		// Linux/macOS: 使用 pgrep 获取进程数量
+		cmd = exec.Command("pgrep", "-c", "chrom")
+		output, err = cmd.Output()
+		if err == nil && len(output) > 0 {
+			count, _ = strconv.Atoi(strings.TrimSpace(string(output)))
+		}
+	}
+
+	// 如果出现错误，可能是因为没有找到任何进程
+	if err != nil {
+		log.Printf("检查Chrome进程状态: 未发现Chrome进程或执行命令失败: %v", err)
+		return
+	}
+
+	log.Printf("检测到 %d 个Chrome相关进程", count)
+
+	// 如果进程数量超过阈值，则进行清理
+	if count > 5 {
+		log.Printf("Chrome进程数量(%d)超过阈值，执行清理...", count)
+		killPreviousChrome()
+
+		// 清理后再次检查
+		time.Sleep(5 * time.Second)
+		checkChromeProcesses()
+	}
+}
+
+// 改进强制终止Chrome进程的函数
+func killPreviousChrome() {
+	log.Println("正在终止残留的Chrome进程...")
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("taskkill", "/F", "/IM", "chrome.exe", "/IM", "chromium.exe")
+	} else if runtime.GOOS == "darwin" {
+		// macOS 特殊处理
+		cmd = exec.Command("pkill", "-9", "-f", "Google Chrome")
+		cmd.Run() // 忽略错误
+		cmd = exec.Command("pkill", "-9", "-f", "Chromium")
+	} else {
+		// Linux
+		cmd = exec.Command("pkill", "-9", "-f", "chrom")
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// 进程不存在时不报错
+		if !strings.Contains(string(output), "没有找到") &&
+			!strings.Contains(string(output), "not found") {
+			log.Printf("终止Chrome进程时出现错误: %v", err)
+		}
+	} else {
+		log.Println("成功终止Chrome进程")
+	}
 }
 
 // 确认满18岁
@@ -1153,10 +1333,18 @@ func (b *Browser) CheckIn() (string, error) {
 
 	// 签到结果
 	var resultText string
-	if strings.Contains(checkInResultHTML, "今日已签到") {
+	if strings.Contains(checkInResultHTML, "已签到") ||
+		strings.Contains(checkInResultHTML, "今日已") ||
+		strings.Contains(checkInResultHTML, "签到成功") {
 		resultText = "98堂每日签到成功，获得2金钱"
+
+		// 标记今天已成功签到
+		taskMutex.Lock()
+		todayCheckInSuccess = true
+		lastCheckInDate = time.Now().Format("2006-01-02")
+		taskMutex.Unlock()
 	} else {
-		resultText = "98堂每日签到签到失败,进行重试"
+		resultText = "98堂每日签到失败，将进行重试"
 	}
 
 	return resultText, nil
@@ -1331,6 +1519,16 @@ func SendTelegramNotification(message string) error {
 func main() {
 	log.Println("程序启动...")
 
+	// 初始化签到状态变量
+	todayCheckInSuccess = false
+	lastCheckInDate = time.Now().Format("2006-01-02")
+
+	// 启动Chrome进程监控
+	monitorStop := make(chan struct{})
+	go func() {
+		monitorChromeProcesses(monitorStop)
+	}()
+
 	// 启动调度器
 	startScheduler()
 
@@ -1339,9 +1537,32 @@ func main() {
 		go executeTask()
 	}
 
+	// 设置信号处理
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
 	// 保持程序运行
 	log.Println("程序已启动，按Ctrl+C停止")
 
-	// 防止程序退出
-	select {}
+	// 等待中断信号
+	<-c
+	log.Println("收到退出信号，正在清理资源...")
+
+	// 停止监控
+	close(monitorStop)
+
+	// 停止调度器
+	if scheduler != nil {
+		scheduler.Stop()
+	}
+
+	// 停止重试计时器
+	if retryTimer != nil {
+		retryTimer.Stop()
+	}
+
+	// 清理Chrome进程
+	killPreviousChrome()
+
+	log.Println("程序已安全退出")
 }
